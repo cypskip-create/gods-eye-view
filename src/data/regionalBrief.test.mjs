@@ -1,7 +1,11 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
 import {
+  REGIONAL_NEWS_WINDOW_HOURS,
+  googleNewsWindowOperator,
   normalizeRegionalArticles,
+  recentRegionalArticles,
+  regionalNewsWindowHours,
   normalizeRegionalPlace,
   normalizeRegionalWeather,
   regionalDistanceM,
@@ -53,6 +57,20 @@ test('zone-naive Open-Meteo timestamps are pinned to UTC, zoned ones pass throug
   assert.equal(invalid.observedAt, null);
 });
 
+test('a reading in the spot’s own time zone keeps the zone and reads its time back to UTC', () => {
+  const local = normalizeRegionalWeather({
+    timezone: 'America/Chicago',
+    utc_offset_seconds: -18000,
+    current: { time: '2026-08-17T10:15', temperature_2m: 20 },
+  });
+  assert.equal(local.observedAt, '2026-08-17T15:15:00.000Z');
+  assert.equal(local.timeZone, 'America/Chicago');
+  assert.equal(local.utcOffsetSeconds, -18000);
+  const bare = normalizeRegionalWeather({ current: { time: '2026-08-17T10:15', temperature_2m: 20 } });
+  assert.equal(bare.timeZone, null);
+  assert.equal(bare.utcOffsetSeconds, null);
+});
+
 test('regional distance handles nearby movement and missing positions', () => {
   const distance = regionalDistanceM(
     { latitude: 38.5, longitude: -121.7 },
@@ -60,4 +78,38 @@ test('regional distance handles nearby movement and missing positions', () => {
   );
   assert.ok(distance > 11000 && distance < 11200);
   assert.equal(regionalDistanceM(null, null), Infinity);
+});
+
+test('regional news is held to one 24-hour window, newest first, undated dropped', () => {
+  assert.equal(REGIONAL_NEWS_WINDOW_HOURS, 24);
+  assert.equal(googleNewsWindowOperator(), 'when:1d');
+  assert.equal(googleNewsWindowOperator(6), 'when:6h');
+  assert.equal(regionalNewsWindowHours('12'), 12);
+  assert.equal(regionalNewsWindowHours(0), 24);
+  assert.equal(regionalNewsWindowHours(undefined), 24);
+  const now = Date.parse('2026-11-04T12:00:00Z');
+  const at = (hours) => new Date(now - hours * 3_600_000).toISOString();
+  const rows = [
+    { title: 'a', publishedAt: at(23) },
+    { title: 'stale', publishedAt: at(25) },
+    { title: 'undated', publishedAt: null },
+    { title: 'garbled', publishedAt: 'not a date' },
+    { title: 'b', publishedAt: at(1) },
+    { title: 'future', publishedAt: at(-2) },
+    { title: 'c', publishedAt: at(5) },
+  ];
+  assert.deepEqual(
+    recentRegionalArticles(rows, { now }).map((row) => row.title),
+    ['b', 'c', 'a'],
+  );
+  assert.deepEqual(
+    recentRegionalArticles(rows, { now, limit: 2 }).map((row) => row.title),
+    ['b', 'c'],
+  );
+  assert.deepEqual(
+    recentRegionalArticles(rows, { now, windowHours: 4 }).map((row) => row.title),
+    ['b'],
+  );
+  assert.deepEqual(recentRegionalArticles([], { now }), []);
+  assert.deepEqual(recentRegionalArticles(undefined, { now }), []);
 });

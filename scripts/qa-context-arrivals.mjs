@@ -7,7 +7,7 @@
  *      [--out qa-shots/context-arrivals] [--only arrivals|contacts]
  *
  * Arrivals: types "Camp Mabry" and "39.7392, -104.9903" (downtown Denver)
- * into the location search, waits for the flight and the photoreal tiles,
+ * into the Omnibar, waits for the flight and the photoreal tiles,
  * orbits a little like a user looking around, and asserts the camera sits at
  * least 60 m above the rendered surface under it and under the view centre.
  *
@@ -28,6 +28,7 @@
 import fs from 'node:fs';
 import path from 'node:path';
 import puppeteer from 'puppeteer';
+import { stubPlanespotters } from './qa-photo-stub.mjs';
 import { createScreencast, moveCamera } from './qa-journey-recorder.mjs';
 
 const argv = process.argv.slice(2);
@@ -77,6 +78,7 @@ const browser = await puppeteer.launch({
 
 async function openPage({ aircraft = false } = {}) {
   const page = await browser.newPage();
+  await stubPlanespotters(page);
   await page.setViewport({ width: 1440, height: 900 });
   page.on('console', (message) => {
     if (message.type() === 'error') result.consoleErrors.push(message.text());
@@ -244,14 +246,11 @@ async function arrivals() {
   const recorder = await createScreencast(page, dir);
   await recorder.start();
   for (const query of ['Camp Mabry', '39.7392, -104.9903']) {
-    await page.evaluate(() =>
-      document.getElementById('search-toggle')?.click(),
-    );
-    await page.focus('#location-search');
+    await page.focus('#gev-omnibar-input');
     await page.evaluate(() => {
-      document.getElementById('location-search').value = '';
+      document.getElementById('gev-omnibar-input').value = '';
     });
-    await page.type('#location-search', query, { delay: 40 });
+    await page.type('#gev-omnibar-input', query, { delay: 40 });
     await page.keyboard.press('Enter');
     // Wait for the flight to land: the camera still for 1.5 s.
     const landed = Date.now();
@@ -360,7 +359,9 @@ async function contacts() {
         entities: ds?.entities.values.length ?? 0,
         created,
         tracked:
-          window.__godsEyeView.viewer.trackedEntity?.gevTrackedId ?? null,
+          window.__godsEyeView.entityRecords.read(
+            window.__godsEyeView.viewer.trackedEntity,
+          )?.trackedId ?? null,
         cockpit: document.body.classList.contains('cockpit-mode'),
       });
       if (samples.length > 5000) samples.splice(0, 1000);
@@ -375,8 +376,9 @@ async function contacts() {
   await page
     .waitForFunction(
       () =>
-        window.__godsEyeView.viewer.trackedEntity?.gevTrackedId ===
-        'flights:aaa051',
+        window.__godsEyeView.entityRecords.read(
+          window.__godsEyeView.viewer.trackedEntity,
+        )?.trackedId === 'flights:aaa051',
       { timeout: 60_000 },
     )
     .catch(() => {});
@@ -474,12 +476,22 @@ async function contacts() {
 
   // SEARCH NEARBY SITES, as the user presses it.
   await page.evaluate(() => {
-    document.getElementById('toast').textContent = '';
+    const toast = document.getElementById('toast');
+    const before = toast.firstChild;
     document.getElementById('installations-search-btn').click();
+    window.__qaToastBefore = before;
   });
+  // Every toast show writes a new text node, even for a repeated message.
   await page
     .waitForFunction(
-      () => document.getElementById('toast').textContent.trim().length > 0,
+      () => {
+        const toast = document.getElementById('toast');
+        return (
+          toast.classList.contains('visible') &&
+          toast.firstChild !== window.__qaToastBefore &&
+          toast.textContent.trim().length > 0
+        );
+      },
       { timeout: 20_000 },
     )
     .catch(() => {});

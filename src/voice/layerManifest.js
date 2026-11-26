@@ -34,9 +34,55 @@ const AIRCRAFT_FIELDS = {
   aircraftClass: ['t'],
   military: ['f'],
   onGround: ['f'],
+  squawk: ['t'],
+  emergency: ['f'],
+  emergencyKind: ['t'],
+  emergencySource: ['t'],
+  emergencyBroadcast: ['t'],
+  lastContactAtMs: ['ms'],
 };
 
 const layers = [
+  {
+    id: 'gnss-integrity',
+    aliases: [
+      'gnss integrity',
+      'navigation integrity',
+      'low navigation accuracy',
+      'gnss interference',
+      'gps interference',
+      'gps jamming',
+      'gnss',
+    ],
+    context: false,
+    noQuery: 'navigation-integrity cells; no countable analyst records',
+  },
+  {
+    id: 's2-ghostmaps',
+    aliases: [
+      's2 ghostmaps',
+      'ghost maps',
+      'ghostmaps',
+      's2 underground',
+      's2 intel',
+      'intel picture',
+      'common intelligence picture',
+    ],
+    context: false,
+    noQuery: 'published third-party intel placemarks; not analyst records',
+  },
+  {
+    id: 'sea-marks',
+    aliases: ['seamarks', 'nautical charts', 'buoys', 'openseamap'],
+    context: false,
+    noQuery: 'raster tile overlay; no countable records',
+  },
+  {
+    id: 'ski-pistes',
+    aliases: ['ski slopes', 'ski runs', 'snow map', 'opensnowmap'],
+    context: false,
+    noQuery: 'raster tile overlay; no countable records',
+  },
   {
     id: 'flights',
     track: true,
@@ -188,6 +234,7 @@ const layers = [
         behavior: ['t'],
         complexity: ['t'],
         discoveredTime: ['ms'],
+        lastGrowthTime: ['ms'],
       },
       timeField: 'discoveredTime',
     },
@@ -231,14 +278,62 @@ const layers = [
     noQuery: 'map overlay; no countable records',
   },
   {
+    id: 'air-quality',
+    aliases: ['air quality', 'aqhi', 'smog', 'air pollution'],
+    context: false,
+    query: {
+      fields: {
+        value: ['n'],
+        units: ['t'],
+        parameter: ['t'],
+        averagingMinutes: ['n', 'min'],
+        kind: ['t'],
+        note: ['t'],
+        pm25: ['n', 'µg/m³'],
+        pm10: ['n', 'µg/m³'],
+        o3: ['n', 'µg/m³'],
+        no2: ['n', 'µg/m³'],
+        so2: ['n', 'µg/m³'],
+        co: ['n', 'mg/m³'],
+        band: ['t'],
+        scale: ['t'],
+        provider: ['t'],
+        name: ['t'],
+        zone: ['t'],
+        observedMs: ['ms'],
+      },
+      viewportLoaded: true,
+      // A region or area count outside the view holds only what is loaded.
+      viewportAreas: true,
+      viewportNote: 'air-quality loads OpenAQ stations by viewport',
+      timeField: 'observedMs',
+    },
+  },
+  {
     id: 'traffic',
     aliases: ['street traffic', 'road traffic', 'congestion'],
     context: false,
-    noQuery: 'road-speed overlay; no countable records',
+    noQuery: 'road-speed overlay; segments listed in Context, not counted',
   },
   {
     id: 'transit',
-    aliases: ['buses', 'trains', 'public transit', 'trams', 'subway'],
+    aliases: [
+      'buses',
+      'trains',
+      'public transit',
+      'trams',
+      'subway',
+      'trolleybus',
+      'trolleybuses',
+      'gondola',
+      'gondolas',
+      'cable car',
+      'cable cars',
+      'funicular',
+      'funiculars',
+      'monorail',
+      'monorails',
+    ],
     context: false,
     query: {
       fields: {
@@ -300,7 +395,12 @@ const layers = [
   },
   {
     id: 'street-level',
-    aliases: ['street level', 'street-level imagery', 'mapillary'],
+    aliases: [
+      'street level',
+      'street-level imagery',
+      'mapillary',
+      'street view',
+    ],
     context: false,
     noQuery: 'street-level imagery; no countable records',
   },
@@ -352,7 +452,24 @@ const layers = [
     id: 'telegeography-submarine-cables',
     aliases: ['submarine cables', 'undersea cables', 'cables', 'telegeography'],
     context: false,
-    noQuery: 'cable records are not loaded for queries',
+    noQuery: 'cable routes; listed in Context, not counted',
+  },
+  {
+    // Results of the last osm_query ("hospitals in Kathmandu").
+    id: 'osm-places',
+    aliases: ['osm places', 'map search results', 'search results'],
+    context: false,
+    query: {
+      fields: {
+        name: ['t'],
+        kind: ['t'],
+        operator: ['t'],
+        emergency: ['t'],
+        wheelchair: ['t'],
+        openingHours: ['t'],
+        city: ['t'],
+      },
+    },
   },
   {
     // Global Context owns this layer; voice reaches it through
@@ -372,6 +489,16 @@ const layers = [
 export const VOICE_OFF_LAYERS = Object.freeze({
   'bhote-koshi-2026': 'scene-driven event layer (control_scene)',
   'bhote-koshi-locator': 'scene-driven event layer (control_scene)',
+  // The Realtime prompt is at its 55,500-character budget; voice toggle and
+  // query for this layer wait until there is room.
+  'drone-airspace':
+    'informational airspace layer; no room in the prompt budget',
+  // Same budget: a historical wreck archive waits for room too.
+  shipwrecks: 'historical shipwreck archive; no room in the prompt budget',
+  news: 'browsed in the News panel; voice tools are a later step',
+  'wildlife-sightings':
+    'community observation layer; no room in the prompt budget',
+  rail: 'train layer; no room in the prompt budget, and "trains" still names transit',
 });
 
 const TYPE_NAMES = Object.freeze({
@@ -407,6 +534,8 @@ function normalizeEntry(entry) {
           window: entry.query.window || null,
           caveat: entry.query.caveat || null,
           viewportLoaded: entry.query.viewportLoaded === true,
+          viewportAreas: entry.query.viewportAreas === true,
+          viewportNote: entry.query.viewportNote || null,
         })
       : null,
   });
@@ -475,19 +604,30 @@ const SELF_EVIDENT_IDS = new Set([
   'directions',
 ]);
 
+/** Lower case with spaces and hyphens removed: "Data centers" → "datacenters". */
+const spelled = (text) => text.toLowerCase().replace(/[\s-]+/g, '');
+
 /**
  * Compact model-facing alias hint: "alias/alias→id; …" for toggleable layers
  * whose id is not already the spoken word. At most two aliases per layer keep
- * the tool JSON small; the runner accepts the full alias list.
+ * the tool JSON small; the runner accepts the full alias list. Of those two,
+ * an alias the id already spells ("dams"→local-dams, "weather radar"→
+ * weather-radar) is left out, and a layer with neither left gets no hint.
  * @returns {string} One line for the layerId description.
  */
 export function voiceLayerAliasHint() {
   return VOICE_LAYER_MANIFEST.filter(
-    (entry) =>
-      entry.toggle && entry.aliases.length && !SELF_EVIDENT_IDS.has(entry.id),
+    (entry) => entry.toggle && !SELF_EVIDENT_IDS.has(entry.id),
   )
-    .map((entry) => `${entry.aliases.slice(0, 2).join('/')}→${entry.id}`)
-    .join('; ');
+    .map((entry) => ({
+      id: entry.id,
+      aliases: entry.aliases
+        .slice(0, 2)
+        .filter((alias) => !spelled(entry.id).includes(spelled(alias))),
+    }))
+    .filter((entry) => entry.aliases.length)
+    .map((entry) => `${entry.aliases.join('/')}→${entry.id}`)
+    .join(';');
 }
 
 /** Field names that already carry their unit (altitudeM, speedKts, …). */

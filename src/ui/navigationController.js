@@ -1,6 +1,7 @@
+import { findCamera } from '../render/rendererOf.js';
+import { stopFollowing } from '../data/followed.js';
 import { cancelCameraArrival } from '../data/cameraArrival.js';
 import { createStateChannel } from '../app/stateChannel.js';
-import * as Cesium from 'cesium';
 import {
   beginDeferredNavigation,
   reassertNavigationHandoff,
@@ -12,10 +13,10 @@ export class NavigationController {
   constructor({
     viewer,
     tracking,
-    searchInput,
+    settleSearch = () => {},
     interruptCameraMotion,
+    interruptGlobeRotation = () => {},
     isCockpitActive,
-    clearLocation,
     cancelShareSelection,
     getDataManager,
     stopOrbit,
@@ -25,10 +26,10 @@ export class NavigationController {
     Object.assign(this, {
       viewer,
       tracking,
-      searchInput,
+      settleSearch,
       interruptCameraMotion,
+      interruptGlobeRotation,
       isCockpitActive,
-      clearLocation,
       cancelShareSelection,
       getDataManager,
       stopOrbit,
@@ -42,21 +43,14 @@ export class NavigationController {
     this._activeLocationSearchGeneration = null;
     this._disposed = false;
   }
-  _stampNavigation({
-    cancelPendingSelection = true,
-    clearSearchedLocation = true,
-  } = {}) {
+  _stampNavigation({ cancelPendingSelection = true } = {}) {
+    this.interruptGlobeRotation('navigation-intent');
     cancelCameraArrival(this.viewer);
     this.cancelOrientation();
     const { flightsLayer, militaryFlightsLayer, satellitesLayer } =
       this.tracking;
     this._navigationGeneration += 1;
     this._cameraHandoffs?.publish();
-    // A newer destination owns the camera, so the last free-text search is no
-    // longer where we are. DEFERRED navigation opts out here and clears at the
-    // reassert seam instead: a geocode that never resolves moves no camera, and
-    // a lookup that fails must not blank a readout that is still true.
-    if (clearSearchedLocation) this.clearLocation();
     if (cancelPendingSelection) {
       const passivelyClearedShareSelection = this.cancelShareSelection();
       try {
@@ -116,12 +110,11 @@ export class NavigationController {
     return this._navigationGeneration;
   }
 
+  /** Settle the search presentation of the lookup `generation`, once. */
   _settleLocationSearchUi(generation) {
     if (this._activeLocationSearchGeneration !== generation) return;
     this._activeLocationSearchGeneration = null;
-    this.searchInput?.classList.remove('searching', 'expanded');
-    if (this.searchInput) this.searchInput.value = '';
-    this.searchInput?.blur();
+    this.settleSearch();
   }
 
   _releaseFollowCamera({
@@ -174,12 +167,13 @@ export class NavigationController {
     } catch {
       /* best-effort release */
     }
-    this.viewer.trackedEntity = undefined;
+    stopFollowing(this.viewer);
     this.interruptCameraMotion('explicit-navigation');
     this.stopOrbit();
-    if (!preserveCameraFlight) this.viewer.camera.cancelFlight();
+    const camera = findCamera(this.viewer);
+    if (!preserveCameraFlight) camera?.cancelFlight();
     try {
-      this.viewer.camera.lookAtTransform(Cesium.Matrix4.IDENTITY);
+      camera?.release();
     } catch {
       /* teardown race */
     }
@@ -205,15 +199,11 @@ export class NavigationController {
       cockpitActive: this.isCockpitActive(),
       noun,
       showToast: (text) => this.showToast(text),
-      stamp: () =>
-        this._stampNavigation({
-          cancelPendingSelection: false,
-          clearSearchedLocation: false,
-        }),
+      stamp: () => this._stampNavigation({ cancelPendingSelection: false }),
       release: () => {
         this.interruptCameraMotion('camera-orientation');
         this.stopOrbit();
-        this.viewer.camera.cancelFlight();
+        findCamera(this.viewer)?.cancelFlight();
       },
       navigate,
     });
@@ -228,17 +218,11 @@ export class NavigationController {
       cockpitActive: this.isCockpitActive(),
       noun,
       showToast: (text) => this.showToast(text),
-      // The searched-location readout survives the STAMP; only a flight that
-      // actually starts invalidates it (see the release hook below).
-      stamp: () =>
-        this._stampNavigation({
-          cancelPendingSelection,
-          clearSearchedLocation: false,
-        }),
+      stamp: () => this._stampNavigation({ cancelPendingSelection }),
     });
   }
 
-  _reassertNavigationHandoff(generation) {
+  _reassertNavigationHandoff(generation, { trackingOrigin = 'tool' } = {}) {
     return reassertNavigationHandoff({
       generation,
       currentGeneration: this._navigationGeneration,
@@ -246,12 +230,8 @@ export class NavigationController {
       disposed: this._disposed,
       showToast: (text) => this.showToast(text),
       // Reached only once the handoff is granted, immediately before the
-      // deferred flight starts — so a lookup that failed, was superseded, or
-      // was refused by the cockpit leaves the old readout standing.
-      release: () => {
-        this.clearLocation();
-        return this._releaseFollowCamera();
-      },
+      // deferred flight starts.
+      release: () => this._releaseFollowCamera({ trackingOrigin }),
     });
   }
   /** Subscribe to ownership changes without claiming the camera or exposing mutable state. */

@@ -105,7 +105,17 @@ export function parseFirmsCsv(text) {
     if (parts.length < header.length) continue; // malformed row — skip
     const lat = Number(parts[iLat]);
     const lon = Number(parts[iLon]);
-    if (!Number.isFinite(lat) || !Number.isFinite(lon)) continue;
+    // Blank or out-of-range positions are dropped, never read as 0 (see
+    // hasCoordinateValue in firmsAdapt.js for the proxy-record side).
+    if (
+      !parts[iLat].trim() ||
+      !parts[iLon].trim() ||
+      !Number.isFinite(lat) ||
+      !Number.isFinite(lon) ||
+      Math.abs(lat) > 90 ||
+      Math.abs(lon) > 180
+    )
+      continue;
 
     records.push({
       lat,
@@ -153,7 +163,13 @@ export function acquisitionMsUtc(acqDate, acqTime) {
     minutes > 59
   )
     return NaN;
-  return Date.UTC(year, month - 1, day, hours, minutes);
+  const ms = Date.UTC(year, month - 1, day, hours, minutes);
+  const parsed = new Date(ms);
+  return parsed.getUTCFullYear() === year &&
+    parsed.getUTCMonth() === month - 1 &&
+    parsed.getUTCDate() === day
+    ? ms
+    : NaN;
 }
 
 /**
@@ -166,19 +182,44 @@ export function acquisitionMsUtc(acqDate, acqTime) {
  * @returns {Array<Object>} Filtered records (original objects, order preserved).
  */
 export function filterTrailing24h(records, nowMs) {
-  if (!Array.isArray(records) || !Number.isFinite(nowMs)) return [];
+  return trailing24hWindow(records, nowMs).kept;
+}
+
+/**
+ * {@link filterTrailing24h} with the span of `nowMs` values, inclusive, over
+ * which it keeps exactly these records. A caller holding something built from
+ * `kept` can reuse it while its clock stays inside `from..until`.
+ * @param {Array<{acqDate: string, acqTime: string|number}>} records - Parser records.
+ * @param {number} nowMs - Reference epoch milliseconds.
+ * @returns {{kept: Array<Object>, from: number, until: number}} Span in epoch
+ *   ms; NaN (never reusable) for unusable input.
+ */
+export function trailing24hWindow(records, nowMs) {
+  if (!Array.isArray(records) || !Number.isFinite(nowMs))
+    return { kept: [], from: NaN, until: NaN };
   const oldest = nowMs - WINDOW_MS;
   const newest = nowMs + FORWARD_SLACK_MS;
+  let from = -Infinity;
+  let until = Infinity;
   const memo = new Map();
-  return records.filter((record) => {
+  const kept = records.filter((record) => {
     const key = `${record.acqDate}:${record.acqTime}`;
     let ms = memo.get(key);
     if (ms === undefined) {
       ms = acquisitionMsUtc(record.acqDate, record.acqTime);
       memo.set(key, ms);
+      // Each distinct time narrows the span to the clock values that leave
+      // it on the same side of the window.
+      if (ms < oldest) from = Math.max(from, ms + WINDOW_MS + 1);
+      else if (ms > newest) until = Math.min(until, ms - FORWARD_SLACK_MS - 1);
+      else if (Number.isFinite(ms)) {
+        from = Math.max(from, ms - FORWARD_SLACK_MS);
+        until = Math.min(until, ms + WINDOW_MS);
+      }
     }
     return Number.isFinite(ms) && ms >= oldest && ms <= newest;
   });
+  return { kept, from, until };
 }
 
 /** Trimmed string cell at index, '' for missing columns. */

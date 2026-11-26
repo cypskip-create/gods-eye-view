@@ -1,5 +1,9 @@
 import { isUnavailableCapability } from '../sources/capability.js';
 import { createOverpassFeatureSource } from '../sources/overpassFeatures.js';
+import { readResponseJsonCapped } from '../sources/httpBody.js';
+
+const LAYER_COUNTS_MAX_BYTES = 16 * 1024;
+
 /** Parse bounded retry information from a service response. */
 function retryAfterMs(value) {
   if (value == null || String(value).trim() === '') return null;
@@ -23,10 +27,11 @@ export function createApplicationRequestServices({
     terrain: '/api/terrain/heights',
     regional: '/api/regional-brief',
     weather: '/api/weather-effects',
+    layerCounts: '/api/layer-counts',
     summary: '/api/openai/hud-summary',
     ...endpoints,
   };
-  async function request(endpoint, { signal, ...init } = {}) {
+  async function request(endpoint, { signal, maxJsonBytes, ...init } = {}) {
     signal = AbortSignal.any([lifetime, signal].filter(Boolean));
     signal.throwIfAborted();
     const response = await fetchImpl(endpoint, {
@@ -37,9 +42,14 @@ export function createApplicationRequestServices({
     signal.throwIfAborted();
     let data = null;
     try {
-      data = await response.json();
-    } catch {
-      /* Status remains authoritative for non-JSON errors. */
+      if (maxJsonBytes === undefined) data = await response.json();
+      else if (response.ok)
+        data = await readResponseJsonCapped(response, maxJsonBytes, signal);
+      else void response.body?.cancel().catch(() => {});
+    } catch (error) {
+      if (maxJsonBytes !== undefined && error?.code === 'RESPONSE_TOO_LARGE')
+        throw error;
+      // A non-JSON reply still carries its HTTP status.
     }
     signal.throwIfAborted();
     return {
@@ -66,11 +76,12 @@ export function createApplicationRequestServices({
       throw new Error(`${label} unavailable (${response.status})`);
     return response.data;
   }
-  // Learn once per page whether the server has an Overpass instance, so an
+  // Remember valid capability decisions for the page, so an
   // unconfigured server is never asked (and never answers with an error).
-  // Discovery is bounded; a failed or timed-out probe is forgotten and not
+  // Discovery is bounded; failed, malformed or timed-out probes are forgotten and not
   // retried for a short backoff, during which queries go to the server as
   // they would against an older server without the probe.
+  let summaryCapability = null;
   let boundaryCapability = null;
   let boundaryProbeRetryAt = 0;
   function boundariesConfigured() {
@@ -79,10 +90,13 @@ export function createApplicationRequestServices({
     boundaryCapability = request(`${urls.boundaries}/status`, {
       signal: AbortSignal.timeout(boundaryProbe.timeoutMs),
     }).then(
-      (response) =>
-        response.ok && typeof response.data?.configured === 'boolean'
-          ? response.data.configured
-          : null, // an older server: fall back to asking per query
+      (response) => {
+        if (response.ok && typeof response.data?.configured === 'boolean')
+          return response.data.configured;
+        boundaryCapability = null;
+        boundaryProbeRetryAt = Date.now() + boundaryProbe.retryMs;
+        return null; // capability unknown: let this query ask the server
+      },
       (error) => {
         boundaryCapability = null;
         if (lifetime?.aborted) throw error;
@@ -147,12 +161,25 @@ export function createApplicationRequestServices({
         const query = points
           .map(({ lat, lon }) => `${lon.toFixed(5)},${lat.toFixed(5)}`)
           .join(';');
-        return requireOk(
-          await request(`${urls.terrain}?points=${encodeURIComponent(query)}`, {
-            signal,
-          }),
-          'Terrain heights',
-        )?.results;
+        const response = await request(
+          `${urls.terrain}?points=${encodeURIComponent(query)}`,
+          { signal },
+        );
+        // A failed request still carries the real heights the server had, so
+        // the caller can keep them; null marks a point without one.
+        const partial = response.data?.partial;
+        if (
+          !response.ok &&
+          Array.isArray(partial) &&
+          partial.length === points.length
+        ) {
+          const error = new Error(
+            `Terrain heights unavailable (${response.status})`,
+          );
+          error.partial = partial;
+          throw error;
+        }
+        return requireOk(response, 'Terrain heights')?.results;
       },
     },
     regional: {
@@ -164,14 +191,46 @@ export function createApplicationRequestServices({
       },
     },
     weather: {
-      async getConditions(latitude, longitude, options) {
+      async getConditions(
+        latitude,
+        longitude,
+        { exactPoint = false, ...options } = {},
+      ) {
+        const url = pointUrl(urls.weather, latitude, longitude);
         return requireOk(
-          await request(pointUrl(urls.weather, latitude, longitude), options),
+          await request(exactPoint ? url + '&exactPoint=1' : url, options),
           'Weather',
         );
       },
     },
+    layerCounts: {
+      async getCounts(options) {
+        const response = await request(urls.layerCounts, {
+          ...options,
+          headers: { Accept: 'application/json' },
+          maxJsonBytes: LAYER_COUNTS_MAX_BYTES,
+        });
+        return requireOk(response, 'Layer counts');
+      },
+    },
     summary: {
+      // The capability probe, asked once per page: true or false from a
+      // server that answers it, null (unknown) from one that does not.
+      configured() {
+        summaryCapability ??= request(`${urls.summary}/status`, {
+          signal: AbortSignal.timeout(3000),
+        }).then(
+          (response) =>
+            response.ok && typeof response.data?.configured === 'boolean'
+              ? response.data.configured
+              : null,
+          (error) => {
+            if (lifetime?.aborted) throw error;
+            return null;
+          },
+        );
+        return summaryCapability;
+      },
       async summarize(context, { signal } = {}) {
         return request(urls.summary, {
           method: 'POST',

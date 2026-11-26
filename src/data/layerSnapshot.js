@@ -1,4 +1,3 @@
-import { layerFeedState } from './feedState.js';
 /**
  * Shared layer snapshot envelope for voice and HUD answers.
  *
@@ -11,12 +10,27 @@ import { layerFeedState } from './feedState.js';
  * @module data/layerSnapshot
  */
 
+import { keySetupRequirementEnvVars } from '../keySetupCore.mjs';
+import { layerFeedState } from './feedState.js';
+
+/** English key guidance for a layer waiting on any of its keys. */
+function keyBlockedText(ids) {
+  const envVars = [ids]
+    .flat()
+    .map((id) => (id ? keySetupRequirementEnvVars(id) : null))
+    .filter(Boolean);
+  return envVars.length
+    ? `key required: add ${envVars.join(' or ')} in Provider Settings`
+    : 'key required: add a provider key in Provider Settings';
+}
+
 /** Feed states the Data Layers chips and voice/HUD provenance share. */
 export const LAYER_FEED_STATES = Object.freeze([
   'nominal',
   'loading',
   'degraded',
   'stale',
+  'partial',
   'fallback',
   'unavailable',
 ]);
@@ -27,6 +41,7 @@ export const LAYER_FEED_STATE_LABELS = Object.freeze({
   loading: 'LOADING',
   degraded: 'DEGRADED',
   stale: 'STALE',
+  partial: 'PARTIAL',
   fallback: 'FALLBACK',
   unavailable: 'UNAVAILABLE',
 });
@@ -48,8 +63,9 @@ export const FEED_STATE_SEVERITY = Object.freeze({
   degraded: 2,
   stale: 3,
   fallback: 4,
-  nominal: 5,
-  off: 6,
+  partial: 5,
+  nominal: 6,
+  off: 7,
 });
 
 export { layerFeedState } from './feedState.js';
@@ -90,7 +106,7 @@ export function snapshotAgeLabel(lastUpdate, now = Date.now()) {
 /**
  * Pick the most severe feed-state from a list.
  * @param {Iterable<string|null|undefined>} states Feed-state strings.
- * @returns {'nominal'|'loading'|'degraded'|'stale'|'fallback'|'unavailable'|'off'|null}
+ * @returns {'nominal'|'loading'|'degraded'|'stale'|'partial'|'fallback'|'unavailable'|'off'|null}
  */
 export function worstFeedState(states) {
   let worst = null;
@@ -138,7 +154,17 @@ export function layerSnapshot(layer = {}, { now = Date.now() } = {}) {
   const lastUpdate = Number.isFinite(Number(stats.lastUpdate))
     ? Number(stats.lastUpdate)
     : null;
-  const feedState = enabled ? layerFeedState({ ...stats, source }) : 'off';
+  // A layer whose every network waits on a key has no feed yet: voice and
+  // the HUD say so instead of narrating zero records as nominal. A model
+  // field on the map (`fieldShown`) is a feed; the key guidance stays the
+  // error, for the stations.
+  const keyWaiting = stats.keyRequired === true && count === 0;
+  const keyBlocked = keyWaiting && stats.fieldShown !== true;
+  const feedState = !enabled
+    ? 'off'
+    : keyBlocked
+      ? 'unavailable'
+      : layerFeedState({ ...stats, source });
   return {
     id: layer.id || layer.layerKey || null,
     name: layer.name || layer.label || layer.id || layer.layerKey || null,
@@ -149,7 +175,9 @@ export function layerSnapshot(layer = {}, { now = Date.now() } = {}) {
     lastUpdate,
     ageSec: snapshotAgeSec(lastUpdate, now),
     ageLabel: snapshotAgeLabel(lastUpdate, now),
-    error: snapshotError(stats),
+    error:
+      snapshotError(stats) ??
+      (keyWaiting ? keyBlockedText(layer.requiresKeyId) : null),
   };
 }
 
@@ -205,6 +233,8 @@ export function feedProvenanceNote(layers = [], overall = null) {
     return `${s.name || s.id} is ${String(s.feedState).toUpperCase()}${extras ? ` (${extras})` : ''}`;
   });
   const body = bits.join('; ') || `${String(overall).toUpperCase()} feed`;
+  if (overall === 'partial')
+    return `${body}. Narrate that coverage is incomplete with any count; do not claim full coverage.`;
   return `${body}. Narrate that provenance with any count; do not describe this as live.`;
 }
 
@@ -250,4 +280,64 @@ export function viewStateLayerRow(layer, options) {
     source: snap.source,
     lastUpdate: snap.lastUpdate,
   };
+}
+
+/**
+ * The feed state and up to two layer names of a provenance envelope that is
+ * not nominal, or null; the worst layers come first, so the names match the
+ * state. Values stay English (`state` is a feed-state id, `names` are
+ * `layer.name`); the HUD translates them for display.
+ * @param {{ overall?: string|null, layers?: Array<object> }|null} envelope
+ * @returns {{ state: string, names: string[] }|null}
+ */
+export function provenanceTag(envelope) {
+  const overall = envelope?.overall;
+  if (!overall || overall === 'nominal' || overall === 'off') return null;
+  const names = (envelope.layers || [])
+    .filter(
+      (s) => s.feedState && s.feedState !== 'nominal' && s.feedState !== 'off',
+    )
+    .sort(
+      (a, b) =>
+        FEED_STATE_SEVERITY[a.feedState] - FEED_STATE_SEVERITY[b.feedState],
+    )
+    .map((s) => String(s.name || s.id || 'LAYER'))
+    .slice(0, 2);
+  return { state: overall, names };
+}
+
+const upperCase = (word) => word.toUpperCase();
+
+/**
+ * `STATE | text | LAYERS`: the state leads so a narrow readout never clips
+ * it; the layer names trail so they never push out the text.
+ * @param {string} text
+ * @param {{ state: string, names: string[] }|null} tag From `provenanceTag`.
+ * @param {(state: string) => string} [stateLabel]
+ * @param {(name: string) => string} [layerLabel]
+ * @returns {string}
+ */
+export function provenanceLine(
+  text,
+  tag,
+  stateLabel = upperCase,
+  layerLabel = upperCase,
+) {
+  if (!tag) return text;
+  return [stateLabel(tag.state), text, tag.names.map(layerLabel).join('/')]
+    .filter(Boolean)
+    .join(' | ');
+}
+
+/**
+ * Require a matching feedState for warning states: a view that is not
+ * nominal falls back on a missing or different state.
+ * @param {{ feedState?: string|null }|null} response The proxy's reply.
+ * @param {{ overall?: string|null }|null} provenance The context's envelope.
+ * @returns {boolean}
+ */
+export function hudSummaryMatchesProvenance(response, provenance) {
+  const state = provenance?.overall;
+  if (!state || state === 'nominal' || state === 'off') return true;
+  return response?.feedState === state;
 }

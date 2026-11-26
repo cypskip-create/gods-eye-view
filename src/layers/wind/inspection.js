@@ -1,23 +1,28 @@
 import { sampleWind, windSpeed } from './model.js';
 import { sampleScalar } from './fields.js';
+import { toLonLatH } from '../../geo/ellipsoid.js';
+
+// The reading stays English: AI tools read it too. Text is marked for i18n
+// extraction and translated where the WEATHER card shows it (presentation.js).
+const msg = (text) => text;
 
 const DIRECTIONS = [
-  'N',
-  'NNE',
-  'NE',
-  'ENE',
-  'E',
-  'ESE',
-  'SE',
-  'SSE',
-  'S',
-  'SSW',
-  'SW',
-  'WSW',
-  'W',
-  'WNW',
-  'NW',
-  'NNW',
+  msg('N'),
+  msg('NNE'),
+  msg('NE'),
+  msg('ENE'),
+  msg('E'),
+  msg('ESE'),
+  msg('SE'),
+  msg('SSE'),
+  msg('S'),
+  msg('SSW'),
+  msg('SW'),
+  msg('WSW'),
+  msg('W'),
+  msg('WNW'),
+  msg('NW'),
+  msg('NNW'),
 ];
 export const WIND_UNITS = Object.freeze({
   'km/h': 3.6,
@@ -37,43 +42,49 @@ export function formatWindSpeed(speed, units = 'km/h') {
   return `${(speed * WIND_UNITS[unit]).toFixed(1)} ${unit}`;
 }
 
-/** A deliberate snapshot at the map center; does not own pointer input. */
-export function inspectWindAtCenter(
-  snapshot,
-  viewer,
-  cesium,
-  { units, overlay, model, validTime, status, position } = {},
-) {
-  const scene = viewer?.scene;
-  const canvas = scene?.canvas;
-  const ellipsoid = scene?.globe?.ellipsoid || cesium.Ellipsoid?.WGS84;
-  const point =
-    position ||
-    (canvas &&
-      viewer.camera?.pickEllipsoid?.(
-        new cesium.Cartesian2(canvas.clientWidth / 2, canvas.clientHeight / 2),
-        ellipsoid,
-      ));
-  if (!point || !snapshot?.u || !snapshot?.v)
-    return {
-      coordinates: 'No surface reading',
-      wind: 'Aim the map center at Earth',
-      model,
-      validTime,
-      status,
-      explanation:
-        'A location reading needs a loaded forecast and the Earth at the center of the view.',
-    };
-  const location = cesium.Cartographic.fromCartesian(point, ellipsoid);
-  const lon = cesium.Math.toDegrees(location.longitude);
-  const lat = cesium.Math.toDegrees(location.latitude);
-  const vector = sampleWind(
+/** Sample the forecast vector at a supplied longitude and latitude. */
+export function sampleWindReading(snapshot, lon, lat) {
+  if (!snapshot?.grid || !snapshot.u || !snapshot.v || snapshot.unavailable)
+    return null;
+  const { u, v } = sampleWind(
     { ...snapshot.grid, u: snapshot.u, v: snapshot.v },
     lon,
     lat,
   );
-  const speed = windSpeed(vector.u, vector.v);
-  const from = windFrom(vector.u, vector.v);
+  if (!Number.isFinite(u) || !Number.isFinite(v)) return null;
+  return { speed: windSpeed(u, v), from: windFrom(u, v) };
+}
+
+/**
+ * A deliberate snapshot at the map center; does not own pointer input. The
+ * center is where `view.query` (a renderer query port) meets the ellipsoid
+ * under the middle of `view.canvas`, unless `position` (ECEF) is given.
+ */
+export function inspectWindAtCenter(
+  snapshot,
+  { query, canvas } = {},
+  { units, overlay, model, validTime, status, position } = {},
+) {
+  const point =
+    position ||
+    (canvas &&
+      query?.pickEllipsoid(canvas.clientWidth / 2, canvas.clientHeight / 2));
+  const location = point && toLonLatH(point);
+  const reading =
+    location && sampleWindReading(snapshot, location.lon, location.lat);
+  if (!reading)
+    return {
+      coordinates: msg('No surface reading'),
+      wind: msg('Aim the map center at Earth'),
+      model,
+      validTime,
+      status,
+      explanation: msg(
+        'A location reading needs a loaded forecast and the Earth at the center of the view.',
+      ),
+    };
+  const { lon, lat } = location;
+  const { speed, from } = reading;
   const scalar = ['temperature', 'pressure'].includes(overlay)
     ? sampleScalar(snapshot, lon, lat, overlay)
     : null;
@@ -87,11 +98,11 @@ export function inspectWindAtCenter(
     scalarKind: overlay,
     scalarLabel:
       overlay === 'speed'
-        ? 'Wind speed'
+        ? msg('Wind speed')
         : overlay === 'temperature'
-          ? 'Air temperature · 2 m'
+          ? msg('Air temperature · 2 m')
           : overlay === 'pressure'
-            ? 'Sea-level pressure'
+            ? msg('Sea-level pressure')
             : null,
     scalarValue:
       overlay === 'speed'
@@ -102,66 +113,8 @@ export function inspectWindAtCenter(
     model,
     validTime,
     status,
-    explanation:
+    explanation: msg(
       'Interpolated model forecast on an approximately 1° grid. Broad weather patterns, not a street-level measurement.',
-  };
-}
-
-/** One passive marker for the captured location; it never samples on camera movement. */
-export function createWindInspectionMarker({ container, viewer, cesium }) {
-  let removeRender = null;
-  let marker = null;
-  const clear = () => {
-    removeRender?.();
-    removeRender = null;
-    marker?.remove();
-    marker = null;
-    viewer?.scene?.requestRender?.();
-  };
-  return {
-    show(position) {
-      clear();
-      const scene = viewer?.scene;
-      if (
-        !position ||
-        !container?.ownerDocument?.createElement ||
-        !scene?.postRender?.addEventListener ||
-        !scene.cartesianToCanvasCoordinates
-      )
-        return;
-      marker = container.ownerDocument.createElement('div');
-      marker.className = 'gev-wind-inspection-marker';
-      marker.setAttribute('aria-hidden', 'true');
-      marker.style.cssText =
-        'position:absolute;width:18px;height:18px;border:2px solid #fff;border-radius:50%;box-shadow:0 0 0 2px #153440,0 0 0 5px rgba(102,225,242,.35);transform:translate(-50%,-50%);pointer-events:none;z-index:150;';
-      container.appendChild(marker);
-      const occluder = new cesium.EllipsoidalOccluder(
-        scene.globe?.ellipsoid || cesium.Ellipsoid.WGS84,
-        viewer.camera.positionWC,
-      );
-      const render = () => {
-        occluder.cameraPosition = viewer.camera.positionWC;
-        const point = scene.cartesianToCanvasCoordinates(position);
-        const visible =
-          point &&
-          point.x >= 0 &&
-          point.y >= 0 &&
-          point.x <= scene.canvas.clientWidth &&
-          point.y <= scene.canvas.clientHeight &&
-          (scene.mode !== cesium.SceneMode.SCENE3D ||
-            occluder.isPointVisible(position));
-        marker.hidden = !visible;
-        if (!visible) return;
-        const canvasRect = scene.canvas.getBoundingClientRect();
-        const containerRect = container.getBoundingClientRect();
-        marker.style.left = `${point.x + canvasRect.left - containerRect.left}px`;
-        marker.style.top = `${point.y + canvasRect.top - containerRect.top}px`;
-      };
-      removeRender = scene.postRender.addEventListener(render);
-      render();
-      scene.requestRender?.();
-    },
-    clear,
-    destroy: clear,
+    ),
   };
 }

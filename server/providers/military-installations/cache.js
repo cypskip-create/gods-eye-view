@@ -5,6 +5,8 @@ import {
   MILITARY_INSTALLATION_DISK_DIR,
   MILITARY_INSTALLATION_MAX_CACHE,
 } from './constants.js';
+import { writeJsonAtomic } from '../common/http.js';
+import { cachedByConfiguredUpstream } from '../overpass/constants.js';
 import path from 'node:path';
 import { createHash } from 'node:crypto';
 import { promises as fsp } from 'node:fs';
@@ -114,6 +116,9 @@ async function readMilitaryInstallationDisk(
     const entry = JSON.parse(
       await fsp.readFile(militaryInstallationDiskPath(cacheKey, dir), 'utf8'),
     );
+    // Same reason as the Overpass disk cache: the key is the bbox alone, so an
+    // entry written against a different OVERPASS_UPSTREAMS is otherwise a hit.
+    if (!cachedByConfiguredUpstream(entry)) return null;
     if (!militaryInstallationDiskFresh(entry, maxAgeMs)) return null;
     return migrateMilitaryInstallationEntry(entry);
   } catch {
@@ -134,19 +139,15 @@ async function writeMilitaryInstallationDisk(
   dir = MILITARY_INSTALLATION_DISK_DIR,
 ) {
   const target = militaryInstallationDiskPath(cacheKey, dir);
-  // Same directory, so the rename is atomic on POSIX rather than a cross-device copy.
-  const temp = `${target}.${process.pid}.${Math.random().toString(36).slice(2)}.tmp`;
   try {
     await fsp.mkdir(dir, { recursive: true });
-    await fsp.writeFile(temp, JSON.stringify(entry));
-    await fsp.rename(temp, target);
+    await writeJsonAtomic(target, entry);
     return true;
   } catch (err) {
     console.warn(
       '[Installations Proxy] disk cache write failed:',
       err?.message || err,
     );
-    await fsp.rm(temp, { force: true }).catch(() => {});
     return false;
   }
 }

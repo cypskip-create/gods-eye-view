@@ -1,21 +1,152 @@
 import path from 'node:path';
+import https from 'node:https';
 import { promises as fsp } from 'node:fs';
+import { Readable } from 'node:stream';
 
-import { filterTrailing24h, parseFirmsCsv } from '../../src/data/firmsCsv.js';
+import {
+  filterTrailing24h,
+  parseFirmsCsv,
+  trailing24hWindow,
+} from '../../src/data/firmsCsv.js';
+import { acceptsGzip, encodedBody, gzipBody } from './common/compress.js';
+import { readResponseTextCapped, writeJsonAtomic } from './common/http.js';
+
+const NULL_BODY_STATUSES = new Set([204, 205, 304]);
+
+/**
+ * The per-address connection errors behind a fetch failure, or null. Node 24
+ * puts the AggregateError directly on `err.cause`; Node 26's fetch wraps it in
+ * a ConnectTimeoutError one level deeper.
+ * @param {unknown} err
+ * @returns {?Array<unknown>}
+ */
+function connectAttemptErrors(err) {
+  let cause = err?.cause;
+  for (let depth = 0; cause && depth < 3; depth++) {
+    if (Array.isArray(cause.errors)) return cause.errors;
+    cause = cause.cause;
+  }
+  return null;
+}
+
+/**
+ * Describe a fetch failure with its socket-level cause. Node reports every
+ * connection failure as `fetch failed`; the cause carries the error code and
+ * the address that failed (never the URL, which embeds the MAP_KEY).
+ * @param {unknown} err
+ * @returns {string}
+ */
+export function describeFetchError(err) {
+  const message = err?.message || String(err);
+  const cause = err?.cause;
+  if (!cause) return message;
+  const attempts = connectAttemptErrors(err);
+  const parts = attempts?.length
+    ? attempts.map((inner) => inner?.message || inner?.code || String(inner))
+    : [cause.message || cause.code || String(cause)];
+  return `${message} (${parts.join('; ')})`;
+}
+
+/**
+ * Whether a fetch failed because every address it tried failed to connect.
+ * Node's network-family auto-selection gives each address a short attempt
+ * timeout, so a slow IPv4 handshake is abandoned in favour of an unreachable
+ * IPv6 address and the whole request fails (#68).
+ * @param {unknown} err
+ * @returns {boolean}
+ */
+export function isAddressSelectionFailure(err) {
+  return err instanceof TypeError && connectAttemptErrors(err)?.length > 0;
+}
+
+/**
+ * GET over IPv4 only, with one connection attempt bounded by the caller's
+ * signal rather than by the auto-selection attempt timeout.
+ * @param {string} url
+ * @param {{signal?: AbortSignal}} [options]
+ * @returns {Promise<Response>}
+ */
+export function fetchIpv4(url, { signal } = {}) {
+  return new Promise((resolve, reject) => {
+    const request = https.request(
+      url,
+      {
+        method: 'GET',
+        signal,
+        family: 4,
+        autoSelectFamily: false,
+        agent: false,
+      },
+      (response) => {
+        // Nothing thrown here may escape: this callback runs outside the
+        // promise, so an exception would be uncaught and crash the server.
+        try {
+          const status = response.statusCode || 500;
+          // A `Response` only represents statuses up to 599; Node never hands
+          // this callback a 1xx.
+          if (status > 599)
+            throw new Error(`FIRMS returned unsupported status ${status}`);
+          const headers = new Headers();
+          for (const [name, value] of Object.entries(response.headers)) {
+            if (Array.isArray(value))
+              value.forEach((item) => headers.append(name, item));
+            else if (value !== undefined) headers.set(name, String(value));
+          }
+          const nullBody = NULL_BODY_STATUSES.has(status);
+          const upstream = new Response(
+            nullBody ? null : Readable.toWeb(response),
+            { status, statusText: response.statusMessage || '', headers },
+          );
+          if (nullBody) response.resume();
+          resolve(upstream);
+        } catch (error) {
+          response.destroy();
+          reject(error);
+        }
+      },
+    );
+    request.on('error', reject);
+    request.end();
+  });
+}
+
+/**
+ * Fetch a FIRMS URL, retrying once over IPv4 when address selection fails.
+ * Other failures (HTTP status, timeout, DNS) are returned or thrown as is.
+ * @param {string} url
+ * @param {{signal?: AbortSignal}} options
+ * @param {{fetchImpl?: typeof fetch, fetchIpv4Impl?: typeof fetchIpv4, warn?: Function}} [deps]
+ * @returns {Promise<Response>}
+ */
+export async function fetchFirms(
+  url,
+  options,
+  { fetchImpl = fetch, fetchIpv4Impl = fetchIpv4, warn = console.warn } = {},
+) {
+  try {
+    return await fetchImpl(url, options);
+  } catch (err) {
+    if (!isAddressSelectionFailure(err) || options?.signal?.aborted) throw err;
+    warn(`[firms-proxy] ${describeFetchError(err)} — retrying over IPv4`);
+    return fetchIpv4Impl(url, options);
+  }
+}
 
 /**
  * NASA FIRMS live active-fire proxy with a memory + disk cache.
  * Upstream: https://firms.modaps.eosdis.nasa.gov/api/area/csv/{KEY}/{SOURCE}/world/2
  *
- * Merges three VIIRS NRT sources (NOAA-20, NOAA-21, Suomi-NPP — independent
- * satellites, no cross-source dedup) plus MODIS_NRT (combined Terra+Aqua,
- * ~1 km, numeric 0-100 confidence), fetched sequentially (quota courtesy)
+ * Merges two VIIRS NRT sources (NOAA-20, NOAA-21 — independent satellites, no
+ * cross-source dedup) plus MODIS_NRT (combined Terra+Aqua, ~1 km, numeric
+ * 0-100 confidence), fetched sequentially (quota courtesy)
  * with `days=2` (`days=1` means "current UTC day", nearly empty just after
  * 00:00Z) and clamps to the trailing 24 h via src/data/firmsCsv.js. FIRMS
  * quota is 5,000 transactions / 10 min per MAP_KEY, so the cache is the point:
  * TTL 30 min, single-flight refresh, serve-stale-on-failure, and a
  * fresh-enough disk cache (.gev-cache/firms.json) prevents ANY upstream
  * fetch across dev-server restarts. Pattern mirrors celestrakProxy.
+ *
+ * VIIRS_SNPP_NRT is left out: NASA stopped delivering Suomi NPP on 2026-11-02.
  *
  * Routes:
  *   GET /api/firms        → {fetchedAt, stale, ttlMs, sources, count, fires}
@@ -24,21 +155,29 @@ import { filterTrailing24h, parseFirmsCsv } from '../../src/data/firmsCsv.js';
  * Keyless (no FIRMS_MAP_KEY): /api/firms → 503 {error:'no_key'}; status →
  * {hasKey:false}. Upstream is never touched without a key.
  *
+ * /api/firms answers the trailing 24 hours to now. A source may instead
+ * answer the 24 hours to a set time, naming its end as `at` (epoch ms); the
+ * layer's row then shows that time rather than LIVE. This proxy never sets
+ * `at`.
+ *
  * @returns {import('vite').Plugin}
  */
 export function firmsProxy() {
   const TTL_MS = 30 * 60_000;
   const STATUS_TTL_MS = 5 * 60_000;
-  const SOURCES = [
-    'VIIRS_NOAA20_NRT',
-    'VIIRS_NOAA21_NRT',
-    'VIIRS_SNPP_NRT',
-    'MODIS_NRT',
-  ];
+  const SOURCES = ['VIIRS_NOAA20_NRT', 'VIIRS_NOAA21_NRT', 'MODIS_NRT'];
+  /**
+   * Per-source body cap. A VIIRS world/2 pull is ~130k rows x ~100 B, about
+   * 13 MB per satellite in heavy fire season (MODIS runs smaller), so this is a
+   * bound, not a budget.
+   */
+  const FIRMS_MAX_RESPONSE_BYTES = 64 * 1024 * 1024;
   const CACHE_DIR = path.join(process.cwd(), '.gev-cache');
   const CACHE_PATH = path.join(CACHE_DIR, 'firms.json');
-
-  /** @type {?{at: number, sources: Array<object>, fires: Array<object>}} */
+  // Per-minute detection counts ({at, minutes}) beside the cache, so the
+  // layer count can be read without parsing the whole cache.
+  const COUNT_PATH = path.join(CACHE_DIR, 'firms-count.json');
+  /** @type {?{at: number, sources: Array<object>, fires: Array<object>, minutes: Array<object>}} */
   let mem = null;
   let diskChecked = false;
   /** @type {?Promise<?{at: number, sources: Array<object>, fires: Array<object>}>} single-flight refresh */
@@ -47,6 +186,8 @@ export function firmsProxy() {
   let statusCache = null;
   /** @type {?Promise<?{used: number, limit: number}>} */
   let statusInflight = null;
+  /** @type {?{entry: object, stale: boolean, from: number, until: number, body: Buffer, gzip: ?Promise<?Buffer>}} */
+  let served = null;
 
   const mapKey = () => String(process.env.FIRMS_MAP_KEY || '').trim();
 
@@ -58,22 +199,68 @@ export function firmsProxy() {
       if (
         Number.isFinite(parsed?.at) &&
         Array.isArray(parsed?.sources) &&
-        Array.isArray(parsed?.fires)
+        Array.isArray(parsed?.fires) &&
+        (!mem || parsed.at > mem.at)
       ) {
-        mem = parsed;
+        mem = { ...parsed, minutes: minuteCounts(parsed.fires) };
       }
     } catch {
       /* no disk cache yet */
     }
   }
 
-  async function writeDisk(entry) {
+  // A stale feed can cross the 24-hour cutoff between successive reads.
+  // Aggregate by acquisition minute so the count and the layer use the same window.
+  function minuteCounts(fires) {
+    const minutes = new Map();
+    for (const { acqDate, acqTime } of fires) {
+      const key = `${acqDate}:${acqTime}`;
+      const bucket = minutes.get(key);
+      if (bucket) bucket.count++;
+      else minutes.set(key, { acqDate, acqTime, count: 1 });
+    }
+    return [...minutes.values()];
+  }
+
+  async function readCountDisk() {
+    try {
+      const summary = JSON.parse(await fsp.readFile(COUNT_PATH, 'utf8'));
+      if (
+        Number.isFinite(summary?.at) &&
+        Array.isArray(summary.minutes) &&
+        summary.minutes.every(
+          (minute) => Number.isSafeInteger(minute?.count) && minute.count > 0,
+        )
+      )
+        return summary;
+    } catch {
+      /* No complete count summary. */
+    }
+    return null;
+  }
+
+  async function replaceJson(file, value) {
+    try {
+      await writeJsonAtomic(file, value);
+      return true;
+    } catch (err) {
+      console.warn(
+        `[firms-proxy] ${path.basename(file)} write failed:`,
+        err?.message || err,
+      );
+      return false;
+    }
+  }
+
+  async function writeDisk(entry, minutes) {
     try {
       await fsp.mkdir(CACHE_DIR, { recursive: true });
-      await fsp.writeFile(CACHE_PATH, JSON.stringify(entry), 'utf8');
     } catch (err) {
       console.warn('[firms-proxy] cache write failed:', err?.message || err);
+      return;
     }
+    if (await replaceJson(CACHE_PATH, entry))
+      await replaceJson(COUNT_PATH, { at: entry.at, minutes });
   }
 
   /**
@@ -83,9 +270,16 @@ export function firmsProxy() {
    */
   async function fetchSource(key, source) {
     const url = `https://firms.modaps.eosdis.nasa.gov/api/area/csv/${encodeURIComponent(key)}/${source}/world/2`;
-    const res = await fetch(url, { signal: AbortSignal.timeout(60_000) });
-    if (!res.ok) throw new Error(`HTTP ${res.status}`);
-    const records = parseFirmsCsv(await res.text());
+    const signal = AbortSignal.timeout(60_000);
+    const res = await fetchFirms(url, { signal });
+    if (!res.ok) {
+      // Release the connection now rather than when the deadline fires.
+      await res.body?.cancel().catch(() => {});
+      throw new Error(`HTTP ${res.status}`);
+    }
+    const records = parseFirmsCsv(
+      await readResponseTextCapped(res, FIRMS_MAX_RESPONSE_BYTES, signal),
+    );
     if (records === null) throw new Error('non-CSV upstream response');
     return records;
   }
@@ -111,7 +305,7 @@ export function firmsProxy() {
       } catch (err) {
         console.warn(
           `[firms-proxy] ${source} fetch failed:`,
-          err?.message || err,
+          describeFetchError(err),
         );
         sources.push({ source, count: 0, ok: false });
       }
@@ -121,19 +315,34 @@ export function firmsProxy() {
   }
 
   /**
-   * Cache entry → response payload. Fires are RE-filtered to the trailing
-   * 24 h at serve time so a stale cache never serves >24h-old detections.
+   * The payload as bytes, kept because serialising tens of MB per request is
+   * slow. Fires are re-filtered to the trailing 24 h so a stale cache never
+   * serves older detections; the bytes are reused only while the same entry,
+   * stale flag and filter span would produce them again.
    */
-  function buildPayload(entry, stale) {
-    const fires = filterTrailing24h(entry.fires, Date.now());
-    return {
-      fetchedAt: entry.at,
-      stale,
-      ttlMs: TTL_MS,
-      sources: entry.sources,
-      count: fires.length,
-      fires,
-    };
+  function payloadBody(entry, stale) {
+    const now = Date.now();
+    if (
+      served?.entry === entry &&
+      served.stale === stale &&
+      now >= served.from &&
+      now <= served.until
+    ) {
+      return served;
+    }
+    const { kept, from, until } = trailing24hWindow(entry.fires, now);
+    const body = Buffer.from(
+      JSON.stringify({
+        fetchedAt: entry.at,
+        stale,
+        ttlMs: TTL_MS,
+        sources: entry.sources,
+        count: kept.length,
+        fires: kept,
+      }),
+    );
+    served = { entry, stale, from, until, body, gzip: null };
+    return served;
   }
 
   /** mapkey_status transactions, cached 5 min, best-effort (null on failure). */
@@ -146,8 +355,13 @@ export function firmsProxy() {
       statusInflight = (async () => {
         try {
           const url = `https://firms.modaps.eosdis.nasa.gov/mapserver/mapkey_status/?MAP_KEY=${encodeURIComponent(key)}`;
-          const res = await fetch(url, { signal: AbortSignal.timeout(10_000) });
-          if (!res.ok) throw new Error(`HTTP ${res.status}`);
+          const res = await fetchFirms(url, {
+            signal: AbortSignal.timeout(10_000),
+          });
+          if (!res.ok) {
+            await res.body?.cancel().catch(() => {});
+            throw new Error(`HTTP ${res.status}`);
+          }
           const body = await res.json();
           const used = Number(body?.current_transactions);
           const limit = Number(body?.transaction_limit);
@@ -157,7 +371,7 @@ export function firmsProxy() {
         } catch (err) {
           console.warn(
             '[firms-proxy] mapkey status failed:',
-            err?.message || err,
+            describeFetchError(err),
           );
           return null;
         }
@@ -173,15 +387,41 @@ export function firmsProxy() {
     return statusInflight;
   }
 
+  // With a key, count the live cache's acquisition minutes or read the
+  // compact disk summary. This reader neither loads the raw cache nor fetches.
+  async function readLayerCount() {
+    if (!mapKey()) return null;
+    const saved = mem ? null : await readCountDisk();
+    // The feed may have warmed during the sidecar read.
+    const summary = mem ?? saved;
+    if (!summary) return null;
+    const current = filterTrailing24h(summary.minutes, Date.now());
+    const count = current.reduce((total, minute) => total + minute.count, 0);
+    return Number.isSafeInteger(count) && count > 0
+      ? { count, at: summary.at }
+      : null;
+  }
+
   const installMiddleware = (server) => {
     server.middlewares.use('/api/firms', async (req, res) => {
-      const sendJson = (status, obj) => {
+      const send = (status, body, headers = {}) => {
         if (res.headersSent) return;
         res.writeHead(status, {
           'Content-Type': 'application/json',
           'Cache-Control': 'no-store',
+          ...headers,
         });
-        res.end(JSON.stringify(obj));
+        res.end(body);
+      };
+      const sendJson = (status, obj) => send(status, JSON.stringify(obj));
+      const sendPayload = async (entry, stale) => {
+        const kept = payloadBody(entry, stale);
+        // Lazy, so an identity response never waits for gzip.
+        const gzip = acceptsGzip(req)
+          ? await (kept.gzip ??= gzipBody(kept.body).catch(() => null))
+          : null;
+        const encoded = encodedBody(req, kept.body, gzip);
+        send(200, encoded.body, encoded.headers);
       };
       try {
         const subPath = String(req.url || '').split('?')[0];
@@ -219,7 +459,7 @@ export function firmsProxy() {
 
         const entry = mem;
         if (entry && Date.now() - entry.at < TTL_MS) {
-          sendJson(200, buildPayload(entry, false));
+          await sendPayload(entry, false);
           return;
         }
         // Stale or missing → refresh, single-flight (concurrent requests
@@ -228,9 +468,11 @@ export function firmsProxy() {
         if (!inflight) {
           inflight = refreshUpstream(key)
             .then(async (fresh) => {
-              mem = fresh;
-              await writeDisk(fresh);
-              return fresh;
+              // Serve the kept entry, so later requests reuse its body.
+              const kept = { ...fresh, minutes: minuteCounts(fresh.fires) };
+              mem = kept;
+              await writeDisk(fresh, kept.minutes);
+              return kept;
             })
             .catch((err) => {
               console.warn(
@@ -245,9 +487,9 @@ export function firmsProxy() {
         const pending = inflight;
         const fresh = await pending;
         if (fresh) {
-          sendJson(200, buildPayload(fresh, false));
+          await sendPayload(fresh, false);
         } else if (entry) {
-          sendJson(200, buildPayload(entry, true)); // upstream down — stale beats empty
+          await sendPayload(entry, true); // upstream down — stale beats empty
         } else {
           sendJson(502, {
             error: 'firms fetch failed and no cache available',
@@ -261,6 +503,7 @@ export function firmsProxy() {
   };
   return {
     name: 'firms-proxy',
+    api: { readLayerCount },
     configureServer: installMiddleware,
     configurePreviewServer: installMiddleware,
   };

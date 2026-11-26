@@ -1,6 +1,7 @@
 const pause = (ms) => new Promise((resolve) => setTimeout(resolve, ms));
 export const BOSTON = {
   id: 'boston',
+  feedId: 'mbta',
   label: 'Boston (MBTA)',
   lat: 42.3554,
   lon: -71.0605,
@@ -11,6 +12,7 @@ const LIVE_CITIES = [
   BOSTON,
   {
     id: 'austin',
+    feedId: 'capmetro-austin',
     label: 'Austin (CapMetro)',
     lat: 30.2672,
     lon: -97.7431,
@@ -19,6 +21,7 @@ const LIVE_CITIES = [
   },
   {
     id: 'minneapolis',
+    feedId: 'metrotransit-msp',
     label: 'Minneapolis (Metro Transit)',
     lat: 44.9778,
     lon: -93.265,
@@ -27,6 +30,7 @@ const LIVE_CITIES = [
   },
   {
     id: 'helsinki',
+    feedId: 'hsl-helsinki',
     label: 'Helsinki (HSL)',
     lat: 60.1699,
     lon: 24.9384,
@@ -35,6 +39,7 @@ const LIVE_CITIES = [
   },
   {
     id: 'oslo',
+    feedId: 'entur-norway',
     label: 'Oslo (Entur)',
     lat: 59.9139,
     lon: 10.7522,
@@ -66,27 +71,18 @@ export function chooseLiveCities(now = new Date()) {
  */
 export async function selectStyle(page, name, params = {}, wait = pause) {
   let how = 'button';
-  // The presets live in the bottom control panel, which auto-dismisses when
-  // the pointer leaves it: pin it open the way a user does, once.
+  // The presets live in the Visual panel: open it the way its rail button does.
   await page.evaluate(() => {
-    const panel = document.getElementById('control-panel');
-    if (panel && !panel.classList.contains('dock-pinned')) {
-      document
-        .querySelector('.dock-pin-btn[data-pin-target="control-panel"]')
-        ?.click();
-    }
-    window.__godsEyeView.styleManager.setPanelCollapsed?.(
-      'control-panel',
-      false,
-      { explicit: true },
-    );
+    window.__godsEyeView.styleManager.setPanelCollapsed?.('pp-toggles', false, {
+      explicit: true,
+    });
   });
   await wait(400);
   try {
-    await page.$eval(`.style-btn[data-style="${name}"]`, (el) =>
+    await page.$eval(`.visual-presets__style[data-style="${name}"]`, (el) =>
       el.scrollIntoView({ block: 'center' }),
     );
-    await page.click(`.style-btn[data-style="${name}"]`);
+    await page.click(`.visual-presets__style[data-style="${name}"]`);
   } catch {
     how = 'styleManager.setStyle (button not clickable)';
     await page.evaluate(

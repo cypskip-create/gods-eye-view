@@ -1,15 +1,18 @@
 /** Compose UI controls with the application's existing engines and layer instances. */
 import { StyleManager as ApplicationShell } from './applicationShell.js';
 import { LocationSearch } from './location.js';
+import { CITY_POIS } from '../cityPois.js';
 import {
-  CITY_POIS,
   GLOBE_VIEW,
   flyToGlobeView,
   flyToPresetLocation,
   flyToPOI,
   searchAndFlyTo,
 } from '../locations.js';
-import { interruptCameraMotion } from '../cameraVerbs.js';
+import {
+  interruptCameraMotion,
+  interruptGlobeRotation,
+} from '../cameraVerbs.js';
 import { IntelHUD } from '../hud.js';
 import { ShareLinkManager } from '../sharelink.js';
 import { OrbitController } from '../orbit.js';
@@ -24,8 +27,11 @@ import {
   initTrackedReadout,
 } from '../data/trackedReadout.js';
 import {
+  activateWorldOverlayAction,
   destroyWorldOverlay,
+  hitTestWorldOverlay,
   initWorldOverlay,
+  subscribeWorldOverlayActions,
 } from '../overlays/worldOverlay.js';
 import {
   destroyDetection,
@@ -51,21 +57,30 @@ import {
   isScopeMaskEnabled,
   setScopeMaskFeather,
   getScopeMaskFeather,
+  setScopeMaskOpacity,
+  getScopeMaskOpacity,
   setScopeTerminusOverride,
   getScopeTerminusOverride,
   clampScopeTerminusPct,
 } from '../scopeMask.js';
 import {
   fetchRegionalBrief,
+  fetchSpotWeather,
   regionalDistanceM,
   weatherCodeLabel,
 } from '../data/regionalBrief.js';
 
 export class StyleManager extends ApplicationShell {
   constructor(viewer, options = {}) {
+    const weather = options.requestServices?.weather;
+    // When a host replaces the brief, its view centre should only reach a
+    // weather service that the host explicitly supplied.
+    const hasRegionalOverride =
+      typeof options.services?.fetchRegionalBrief === 'function';
     super(viewer, {
       ...options,
       services: {
+        hitTestWorldOverlay,
         CITY_POIS,
         GLOBE_VIEW,
         flyToGlobeView,
@@ -73,6 +88,7 @@ export class StyleManager extends ApplicationShell {
         flyToPOI,
         searchAndFlyTo,
         interruptCameraMotion,
+        interruptGlobeRotation,
         IntelHUD,
         ShareLinkManager,
         OrbitController,
@@ -84,6 +100,8 @@ export class StyleManager extends ApplicationShell {
         initTrackedReadout,
         destroyWorldOverlay,
         initWorldOverlay,
+        subscribeWorldOverlayActions,
+        activateWorldOverlayAction,
         destroyDetection,
         initDetection,
         cycleDetectionMode,
@@ -104,6 +122,8 @@ export class StyleManager extends ApplicationShell {
         isScopeMaskEnabled,
         setScopeMaskFeather,
         getScopeMaskFeather,
+        setScopeMaskOpacity,
+        getScopeMaskOpacity,
         setScopeTerminusOverride,
         getScopeTerminusOverride,
         clampScopeTerminusPct,
@@ -111,6 +131,9 @@ export class StyleManager extends ApplicationShell {
         regionalDistanceM,
         weatherCodeLabel,
         LocationSearch,
+        fetchSpotWeather:
+          weather?.getConditions?.bind(weather) ??
+          (hasRegionalOverride ? undefined : fetchSpotWeather),
         ...options.services,
       },
     });

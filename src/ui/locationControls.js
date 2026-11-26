@@ -1,69 +1,65 @@
-import { locationMiniStatus } from '../locationStatus.js';
 const POI_KEYS = ['Q', 'W', 'E', 'R', 'T'];
 
-/** Location DOM, keyboard handling and pending row animation over supplied actions. */
+/**
+ * The preset places' controls over supplied actions: the Omnibar's city and
+ * landmark chips call `chooseCity()` and `choosePoi()`, Q-W-E-R-T flies to a
+ * landmark of the city last chosen, and the Omnibar runs a place lookup
+ * through `search()`. Whose landmarks are shown, the lookup's error and
+ * whether it runs, and the ORBIT indicator are presented as a plain view and
+ * handed to `publish`; the Omnibar and the scene chrome render them. The
+ * globe actions and the cockpit call `reset()`.
+ */
 export class LocationControls {
   constructor({
-    elements,
     cities,
     getExpandedCity,
     onCity,
     onPoi,
     onSearch,
+    onSearchEdit,
     onReset,
+    publish = () => {},
     doc = document,
-    requestFrame = (callback) => requestAnimationFrame(callback),
-    cancelFrame = (id) => cancelAnimationFrame(id),
   }) {
     Object.assign(this, {
-      elements,
       cities,
       getExpandedCity,
       onCity,
       onPoi,
       onSearch,
+      onSearchEdit,
       onReset,
+      publish,
       doc,
-      requestFrame,
-      cancelFrame,
     });
     this.removers = [];
-    this.poiRemovers = [];
-    this.frame = null;
     this.destroyed = false;
-    this.rowGeneration = 0;
-    elements.pills.replaceChildren();
-    for (const [id, city] of Object.entries(cities)) {
-      const pill = doc.createElement('button');
-      pill.type = 'button';
-      pill.className = 'location-pill';
-      pill.dataset.locationId = id;
-      pill.textContent = city.name;
-      this.bind(pill, 'click', () => onCity(id));
-      elements.pills.appendChild(pill);
-    }
+    this.poiCity = null;
+    this.searchError = null;
+    // Who ran the last lookup ('omnibar' unless a caller names itself); its
+    // error is shown there.
+    this.searchOrigin = null;
+    this.searching = false;
+    // The ORBIT indicator: null until the shell offers it, then whether the
+    // camera orbits.
+    this.orbit = null;
     this.bind(doc, 'keydown', (event) => {
       const cityId = getExpandedCity();
       if (
         !cityId ||
-        event.target?.matches?.('select, input, textarea') ||
-        event.target === elements.search
+        event.target?.matches?.(
+          'select, input, textarea, [contenteditable]:not([contenteditable="false"])',
+        )
       )
         return;
+      // As for the application shortcuts: Cmd+R, Ctrl+W, Alt+E and the like
+      // belong to the browser and the system. Shift is not a chord.
+      if (event.metaKey || event.ctrlKey || event.altKey) return;
       const index = POI_KEYS.indexOf(event.key.toUpperCase());
       if (index !== -1 && index < (cities[cityId]?.pois.length || 0))
         onPoi(cityId, index);
     });
-    this.bind(elements.searchToggle, 'click', () => {
-      elements.search.classList.toggle('expanded');
-      if (elements.search.classList.contains('expanded'))
-        elements.search.focus();
-    });
-    this.bind(elements.search, 'keydown', (event) => {
-      if (event.key === 'Enter') void onSearch(elements.search.value);
-    });
-    for (const button of elements.resetButtons)
-      this.bind(button, 'click', onReset);
+    this.present();
   }
   bind(element, event, handler, removers = this.removers) {
     if (!element) return;
@@ -73,91 +69,88 @@ export class LocationControls {
     element.addEventListener(event, listener);
     removers.push(() => element.removeEventListener(event, listener));
   }
-  cancelExpansion() {
-    this.rowGeneration++;
-    if (this.frame !== null) this.cancelFrame(this.frame);
-    this.frame = null;
+  /** Publish the controls as they stand. */
+  present() {
+    if (!this.destroyed) this.publish(this.presentation());
   }
-  showPois(cityId) {
-    if (this.destroyed) return;
-    const city = this.cities[cityId];
-    if (!city) return;
-    this.cancelExpansion();
-    const generation = this.rowGeneration;
-    for (const remove of this.poiRemovers.splice(0)) remove();
-    this.elements.poiRow.replaceChildren();
-    city.pois.forEach((poi, index) => {
-      const pill = this.doc.createElement('button');
-      pill.type = 'button';
-      pill.className = 'poi-pill';
-      pill.dataset.poiIndex = index;
-      const key = this.doc.createElement('span');
-      key.className = 'poi-pill-key';
-      key.textContent = POI_KEYS[index] || index + 1;
-      const label = this.doc.createElement('span');
-      label.className = 'poi-pill-name';
-      label.textContent = poi.name;
-      pill.append(key, label);
-      this.bind(
-        pill,
-        'click',
-        () => this.onPoi(cityId, index),
-        this.poiRemovers,
-      );
-      this.elements.poiRow.appendChild(pill);
-    });
-    this.frame = this.requestFrame(() => {
-      if (this.destroyed || generation !== this.rowGeneration) return;
-      this.frame = null;
-      this.elements.poiRow.classList.add('expanded');
-      this.elements.divider.classList.add('visible');
-    });
+  /** The controls as they stand. */
+  presentation() {
+    return {
+      poiCity: this.poiCity,
+      searchError: this.searchError,
+      searching: this.searching,
+      searchOrigin: this.searchOrigin,
+      orbit: this.orbit && { ...this.orbit },
+    };
   }
-  hidePois() {
-    if (this.destroyed) return;
-    this.cancelExpansion();
-    this.elements.poiRow.classList.remove('expanded');
-    this.elements.divider.classList.remove('visible');
-  }
-  highlightPoi(index) {
-    if (this.destroyed) return;
-    for (const pill of this.elements.poiRow.querySelectorAll('.poi-pill'))
-      pill.classList.toggle('active', Number(pill.dataset.poiIndex) === index);
-  }
-  highlightCity(id) {
-    if (this.destroyed) return;
-    for (const pill of this.elements.pills.querySelectorAll('.location-pill'))
-      pill.classList.toggle('active', pill.dataset.locationId === id);
-  }
-  renderStatus(state) {
-    if (this.destroyed || !this.elements.statusCity || !this.elements.statusPoi)
-      return;
-    const lines = locationMiniStatus(state);
-    this.elements.statusCity.textContent = lines.city;
-    this.elements.statusPoi.textContent = lines.poi;
-  }
-  createOrbitIndicator() {
-    if (this.destroyed) return null;
-    if (!this.orbitIndicator) {
-      this.orbitIndicator = this.doc.createElement('div');
-      this.orbitIndicator.id = 'orbit-indicator';
-      const icon = this.doc.createElement('span');
-      icon.className = 'orbit-icon';
-      icon.textContent = '↻';
-      this.orbitIndicator.append(icon, ' ORBIT');
-      this.doc.body.appendChild(this.orbitIndicator);
+  /** Look a place up, flying to it when found. */
+  search(query, { origin = 'omnibar' } = {}) {
+    if (this.destroyed || !String(query || '').trim()) return false;
+    this._requestedSearchOrigin = origin;
+    try {
+      return this.onSearch(query);
+    } finally {
+      this._requestedSearchOrigin = null;
     }
-    return this.orbitIndicator;
+  }
+  /** Editing the Omnibar's query clears its prior lookup error. */
+  editSearch() {
+    if (!this.destroyed && this.searchOrigin === 'omnibar')
+      this.onSearchEdit?.();
+  }
+  /** A preset city was chosen. */
+  chooseCity(id) {
+    if (!this.destroyed) this.onCity(id);
+  }
+  /** A reset to the full globe view was asked for. */
+  reset() {
+    if (!this.destroyed) return this.onReset();
+  }
+  /** A landmark of the city whose landmarks are shown was chosen. */
+  choosePoi(index) {
+    if (!this.destroyed && this.poiCity !== null)
+      this.onPoi(this.poiCity, index);
+  }
+  /** Show `cityId`'s landmarks. */
+  showPois(cityId) {
+    if (this.destroyed || !this.cities[cityId]) return;
+    this.poiCity = cityId;
+    this.present();
+  }
+  /** Show, or with null clear, the lookup's error. */
+  setSearchError(message) {
+    if (this.destroyed) return;
+    this.searchError = message || null;
+    this.present();
+  }
+  /** Mark whether a lookup runs. */
+  setSearching(active) {
+    if (this.destroyed) return;
+    if (active && this._requestedSearchOrigin)
+      this.searchOrigin = this._requestedSearchOrigin;
+    this.searching = Boolean(active);
+    this.present();
+  }
+  /** A lookup settled. */
+  settleSearch() {
+    if (this.destroyed) return;
+    this.searching = false;
+    this.present();
+  }
+  /** Offer the ORBIT indicator, lit while the camera orbits. */
+  showOrbit(active = false) {
+    if (this.destroyed) return;
+    this.orbit = { active: Boolean(active) };
+    this.present();
   }
   destroy() {
     if (this.destroyed) return;
     this.destroyed = true;
-    this.cancelExpansion();
-    for (const remove of [
-      ...this.poiRemovers.splice(0),
-      ...this.removers.splice(0),
-    ])
-      remove();
-    this.orbitIndicator?.remove();
+    for (const remove of this.removers.splice(0)) remove();
+    // The ORBIT indicator leaves with its owner.
+    if (this.orbit) {
+      this.orbit = null;
+      this.publish(this.presentation());
+    }
   }
 }
